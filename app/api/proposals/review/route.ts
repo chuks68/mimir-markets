@@ -7,11 +7,9 @@
  * and the shared `CRON_SECRET` — the same pattern as the cron routes. An unset
  * `CRON_SECRET` refuses rather than waving callers through.
  *
- * Review mutations support authenticated signed request windows (`nonce`, `expiresAt`)
- * and optimistic concurrency control through `expectedRevision`. When an expected
- * revision is provided and the proposal review state is stale (the current review
- * revision is newer than expected), the mutation is rejected with a typed HTTP 409
- * conflict (`apiError("conflict", ...)`), leaving the newer review decision unchanged.
+ * Cancellation is scoped to exactly one proposal per request: the transition is
+ * authorised for the named `proposalId` only, and never widens to other
+ * proposals or to delegated spending grants.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -82,25 +80,11 @@ function parseIntParam(raw: string | null): number | undefined {
   return Math.trunc(n);
 }
 
-/**
- * Compute the current review revision for a proposal.
- *
- * An unreviewed or queued/in-review proposal is at revision 0.
- * Once a review decision has been recorded (approved, rejected, or decided review),
- * the revision advances to 1. An explicit numeric revision field on the record
- * is preferred when present.
- */
-export function getProposalRevision(proposal: MarketProposalRow): number {
-  if (typeof (proposal as unknown as { revision?: number }).revision === "number") {
-    return (proposal as unknown as { revision?: number }).revision!;
-  }
-  const isDecided =
-    proposal.reviewed_at !== null ||
-    proposal.review_status === "approved" ||
-    proposal.review_status === "rejected" ||
-    (proposal as unknown as { review?: string }).review === "agree" ||
-    (proposal as unknown as { review?: string }).review === "disagree";
-  return isDecided ? 1 : 0;
+/** Require a non-empty string; returns the trimmed value or null. */
+function requireString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
@@ -265,14 +249,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       }
 
       case "cancel": {
-        if (!proposalId || !reason) {
+        // Authorise exactly one proposal transition. The id and reason are
+        // validated as non-empty strings so a malformed or blank request can
+        // never reach the state change, and only the named proposal is passed
+        // through. Other proposals and delegated spending grants are untouched.
+        const targetId = requireString(proposalId);
+        const cancelReason = requireString(reason);
+        if (!targetId || !cancelReason) {
           return errorResponse("cancel requires proposalId and reason", 400);
         }
-        const ok = await cancelProposal(proposalId, reason);
+        const ok = await cancelProposal(targetId, cancelReason);
         if (!ok) {
           return errorResponse("Proposal not cancellable (not queued or in_review)", 409);
         }
-        return json({ success: true, proposalId, status: "cancelled" });
+        return json({ success: true, proposalId: targetId, status: "cancelled" });
       }
 
       case "mark_dependency_failed": {
