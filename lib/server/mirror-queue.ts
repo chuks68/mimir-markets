@@ -3,7 +3,7 @@
  *
  * Following a basket records an intent; it cannot move money on its own. Soroban
  * has no `msg.sender` for a top-level call, so the staking account is an explicit
- * argument that must itself authorise -- `challenge_claim(challenger, …#` cannot
+ * argument that must itself authorise -- `challenge_claim(challenger, …)` cannot
  * execute without that account's signature, and Mimir holds no key for the
  * subscriber. Delegated signing would need an owner-granted USDC allowance
  * (`lib/agents/spend-permissions.ts`), which a plain basket follower has not given.
@@ -20,13 +20,7 @@
 import "server-only";
 
 import { getChallengersByClaimId, getClaimsByFilter, listBasketSubscriptions } from "@/lib/db";
-import {
-  type BasketPolicy,
-  DEFAULT_BASKET_POLICY,
-  type FollowerMirrorPreview,
-  type FollowerPosition,
-  previewFollowerMirrorExposure,
-} from "../baskets";
+import { computeMirrorAmountAtomic, toUsdcAtomic } from "@/lib/baskets";
 import { allBasketDefinitions } from "./basket-directory";
 import { listDirectoryAgents } from "./agent-directory";
 import { parseAddressParam } from "./api-validation";
@@ -39,10 +33,10 @@ export interface PendingMirror {
   /** The member whose position is being copied. */
   agentId: string;
   agentName: string;
-  /** What that member staked, display USDC. */
-  memberStakeUsdc: number;
-  /** What the subscriber would stake: their per-market cap scaled by weight. */
-  mirrorUsdc: number;
+  /** What that member staked, in exact 7-decimal atomic USDC units (base-10 integer string). */
+  memberStakeAtomic: string;
+  /** What the subscriber would stake: per-market cap scaled by weight, in exact 7-decimal atomic USDC units. */
+  mirrorAmountAtomic: string;
   weightBps: number;
   deadline: number;
   category: string;
@@ -57,16 +51,8 @@ export interface MirrorQueueDependencies {
   listSubscriptions: (wallet: string) => Promise<string[]>;
   listDefinitions: () => Promise<Array<{ id: string; name: string; members: Array<{ agentId: string; weightBps: number }> }>>;
   listAgents: () => Promise<Array<{ id: string; displayName: string; address: string }>>;
-  listOpenClaims: () => Promise<Array<{
-    id: number;
-    question?: string | null;
-    deadline: number;
-    creator?: string | null;
-    category?: string | null;
-    market_type?: string | null;
-  }>>;
-  listChallengers: (claimId: number) => Promise<Array<{ address: string; stake: number }>>;
-  listFollowerPositions?: (wallet: string) => Promise<FollowerPosition[]>;
+  listOpenClaims: () => Promise<Array<{ id: number; question?: string | null; deadline: number; creator?: string | null }>>;
+  listChallengers: (claimId: number) => Promise<Array<{ address: string; stake: number; stakeAtomic?: string | bigint }>>;
 }
 
 const defaultDependencies: MirrorQueueDependencies = {
@@ -132,10 +118,22 @@ export async function pendingMirrorsFor(
         const position = challengers.find((c) => c.address === agent.address);
         if (!position) continue;
 
-        const mirrorUsdc = Math.round((budget * member.weightBps / 10_000) * 100) / 100;
-        // Below a cent there is nothing to stake; the contract's minimum would
-        // reject it anyway and the row would only be noise.
-        if (mirrorUsdc <= 0) continue;
+        const mirrorAtomic = computeMirrorAmountAtomic(budget, member.weightBps);
+        if (mirrorAtomic <= 0n) continue;
+
+        let memberStakeAtomic: string;
+        try {
+          memberStakeAtomic =
+            position.stakeAtomic !== undefined
+              ? toUsdcAtomic(
+                  typeof position.stakeAtomic === "bigint"
+                    ? position.stakeAtomic
+                    : BigInt(position.stakeAtomic),
+                ).toString()
+              : toUsdcAtomic(position.stake).toString();
+        } catch {
+          continue;
+        }
 
         const category = claim.category ?? "general";
         const mode = claim.market_type ?? "pool";
@@ -143,21 +141,11 @@ export async function pendingMirrorsFor(
 
         seenClaims.add(claim.id);
         pending.push({
-          basketId,
-          basketName: definition.name,
-          claimId: claim.id,
-          question: claim.question ?? `Claim #${claim.id}`,
-          agentId: agent.id,
-          agentName: agent.displayName,
-          memberStakeUsdc: position.stake,
-          mirrorUsdc,
-          weightBps: member.weightBps,
-          deadline: claim.deadline,
-          category,
-          mode,
-          remainingBudgetUsdc,
-          requiresUserSignature: true,
-          delegatedAuthority: false,
+          basketId, basketName: definition.name,
+          claimId: claim.id, question: claim.question ?? `Claim #${claim.id}`,
+          agentId: agent.id, agentName: agent.displayName,
+          memberStakeAtomic, mirrorAmountAtomic: mirrorAtomic.toString(),
+          weightBps: member.weightBps, deadline: claim.deadline,
         });
         break; // one mirror per claim: the basket takes a side, not several
       }

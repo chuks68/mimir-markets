@@ -477,6 +477,8 @@ export const SCHEMA_STATEMENTS: SqlStatement[] = [
   { sql: "CREATE INDEX IF NOT EXISTS idx_payments_v2_resource ON payments_v2(resource)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_payments_v2_seller ON payments_v2(seller)" },
   { sql: "CREATE INDEX IF NOT EXISTS idx_payments_v2_tx ON payments_v2(network, transaction_hash, resource)" },
+  { sql: "ALTER TABLE payments_v2 ADD COLUMN IF NOT EXISTS resource_digest TEXT" },
+  { sql: "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_v2_digest ON payments_v2(network, payment_identifier, resource_digest)" },
   // The oracle's classic USDC bonus transfer is outside Soroban settlement.
   // Reserve once before submission; an ambiguous failure stays held for manual
   // reconciliation rather than risking a second transfer after a restart.
@@ -1718,6 +1720,66 @@ export async function getProposalPrecision(): Promise<{
     reviewed,
     agreed,
     precisionBps: reviewed > 0 ? Math.round((agreed * 10_000) / reviewed) : null,
+  };
+}
+
+/**
+ * All valid review-queue states.
+ * Used by the review route to validate the `status` query/body parameter
+ * without coupling the validation logic to the MarketProposalRow type literal.
+ */
+export const REVIEW_STATUSES = [
+  "queued",
+  "in_review",
+  "approved",
+  "rejected",
+  "cancelled",
+  "stale",
+  "dependency_failed",
+] as const;
+
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
+
+/**
+ * List market proposals queued for review, optionally filtered by status.
+ *
+ * Pagination parameters are clamped: limit to [1, 200] (default 50), offset
+ * to [0, ∞) (default 0). NaN values fall back to their defaults so that a
+ * caller passing a non-numeric query string still gets a valid response.
+ */
+export async function listProposalsForReview(opts: {
+  status?: ReviewStatus | null;
+  limit?: number;
+  offset?: number;
+}): Promise<{ proposals: MarketProposalRow[]; limit: number; offset: number }> {
+  const pool = await getDb();
+
+  const rawLimit = opts.limit;
+  const rawOffset = opts.offset;
+
+  const limit = Number.isFinite(rawLimit) && !Number.isNaN(rawLimit)
+    ? Math.max(1, Math.min(200, Math.trunc(rawLimit!)))
+    : 50;
+  const offset = Number.isFinite(rawOffset) && !Number.isNaN(rawOffset)
+    ? Math.max(0, Math.trunc(rawOffset!))
+    : 0;
+
+  let sql: string;
+  let args: unknown[];
+
+  if (opts.status != null) {
+    sql = `SELECT * FROM market_proposals WHERE review_status = $1 ORDER BY queued_at ASC LIMIT $2 OFFSET $3`;
+    args = [opts.status, limit, offset];
+  } else {
+    sql = `SELECT * FROM market_proposals ORDER BY queued_at ASC LIMIT $1 OFFSET $2`;
+    args = [limit, offset];
+  }
+
+  const result = await pool.query(sql, args);
+  return {
+    proposals: (result.rows ?? []) as MarketProposalRow[],
+    limit,
+    offset,
   };
 }
 

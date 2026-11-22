@@ -18,15 +18,104 @@ import { isValidBps } from "./money";
  * This means a captured basket-creation signature cannot be replayed to
  * insert duplicate baskets.
  */
+export class BasketValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly agentId?: string,
+    public readonly weights?: number[],
+  ) {
+    super(message);
+    this.name = "BasketValidationError";
+  }
+}
+
+export interface BasketMember {
+  agentId: string;
+  weightBps: number;
+}
+
+/**
+ * Reject duplicate members carrying conflicting weights (#894).
+ *
+ * A basket composition is valid iff every agentId appears at most once, OR
+ * appears multiple times with the *identical* weight (which collapses to a
+ * single entry — the deterministic canonical form).
+ *
+ * Deterministic and side-effect free: the error names the offending agentId
+ * and the conflicting weights, but no timestamps, orderings, or host data.
+ */
+export function validateBasketComposition(members: readonly BasketMember[]): void {
+  const byAgent = new Map<string, number[]>();
+  for (const member of members) {
+    if (typeof member.agentId !== "string" || member.agentId.length === 0) {
+      throw new BasketValidationError("basket member has empty agentId");
+    }
+    if (!Number.isInteger(member.weightBps) || member.weightBps <= 0) {
+      throw new BasketValidationError(
+        "basket member weightBps must be a positive integer",
+        member.agentId,
+        [member.weightBps],
+      );
+    }
+    const weights = byAgent.get(member.agentId) ?? [];
+    weights.push(member.weightBps);
+    byAgent.set(member.agentId, weights);
+  }
+  for (const [agentId, weights] of byAgent) {
+    if (weights.length > 1 && new Set(weights).size > 1) {
+      throw new BasketValidationError(
+        `duplicate basket member ${agentId} carries conflicting weights: ${weights.join(", ")}`,
+        agentId,
+        weights.slice(),
+      );
+    }
+  }
+}
+
+/**
+ * Return the canonical member ordering, collapsing identical-weight duplicates.
+ *
+ * Sort key: agentId ascending; tie-break by weightBps ascending. Two baskets
+ * with the same members produce byte-identical canonical arrays regardless of
+ * input order. Call ONLY after validateBasketComposition() has passed.
+ */
+export function canonicalizeMembers(members: readonly BasketMember[]): BasketMember[] {
+  const byAgent = new Map<string, number>();
+  for (const member of members) {
+    const existing = byAgent.get(member.agentId);
+    if (existing === undefined) {
+      byAgent.set(member.agentId, member.weightBps);
+    } else if (existing !== member.weightBps) {
+      // Defensive: validateBasketComposition should have rejected this.
+      throw new BasketValidationError(
+        `canonicalizeMembers received conflicting weights for ${member.agentId}`,
+        member.agentId,
+        [existing, member.weightBps],
+      );
+    }
+  }
+  return [...byAgent.entries()]
+    .map(([agentId, weightBps]) => ({ agentId, weightBps }))
+    .sort((a, b) => {
+      if (a.agentId !== b.agentId) return a.agentId < b.agentId ? -1 : 1;
+      return a.weightBps - b.weightBps;
+    });
+}
+
 export function basketMessage(args: {
   name: string; creator: string; members: Array<{ agentId: string; weightBps: number }>;
   nonce: string; expiresAt: number;
 }): string {
+  // Validate before serialization (#894): a signed message must not carry a
+  // contradictory composition. Canonicalize so signature bytes are stable
+  // regardless of the caller's array order.
+  validateBasketComposition(args.members);
+  const canonicalMembers = canonicalizeMembers(args.members);
   return [
     "Mimir basket",
     `name: ${args.name}`,
     `creator: ${args.creator}`,
-    `members: ${args.members.map((m) => `${m.agentId}:${m.weightBps}`).join(",")}`,
+    `members: ${canonicalMembers.map((m) => `${m.agentId}:${m.weightBps}`).join(",")}`,
     `nonce: ${args.nonce}`,
     `expiresAt: ${new Date(args.expiresAt).toISOString()}`,
   ].join("\n");
@@ -54,7 +143,7 @@ export const TRANSFER_EXPIRY_MS = 5 * 60_000; // 5 minutes
  * What the CURRENT owner signs to authorise a transfer.
  *
  * Both addresses are interpolated verbatim — Stellar strkeys are case-sensitive
- * base32 and must never be lowercased. The message now also includes:
+ * base32 and must never be lowercased. The message also includes:
  *
  *  - `nonce`    — a client-generated UUID, stored on the server after first use
  *                  so the same signed message is rejected on any replay attempt.
@@ -161,9 +250,9 @@ export function parsePerMarketUsdc(raw: string): PerMarketParseResult {
  *
  * Kept here (the pure computation module, no server-only dependency) so that
  * tests and non-server code can verify the curated-basket guard without pulling
- * in lib/server/basket-directory which carries `import "server-only"".
+ * in lib/server/basket-directory which carries `import "server-only"`.
  *
- * This list must stay in sync with BASKT
+ * This list must stay in sync with the basket directory.
  */
 export const CURATED_BASKET_IDS: readonly string[] = [
   "council-core",
@@ -199,25 +288,13 @@ export interface BasketAgentWeight {
   mode: string;
   paused?: boolean;
   stale?: boolean;
+  /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
+  returns: number[];
 }
 
-export interface BasketReturnPoint {
-  timestamp: number;
-  returnsBps: Record<string, number>;
-}
-
-export interface BasketPolicy {
-  maxSingleAgentBps: number;
-  maxCategoryBps: number;
-  staleSignalAction: "skip" | "pause";
-  failedCopyAction: "keep_idle" | "pause";
-}
-
-export interface BasketSnapshot {
-  timestamp: number;
-  navAtomic: bigint;
-  drawdownBps: number;
-}
+export interface BasketReturnPoint { timestamp: number; returnsBps: Record<string, number> }
+export interface BasketPolicy { maxSingleAgentBps: number; maxCategoryBps: number; staleSignalAction: "skip" | "pause"; failedCopyAction: "keep_idle" | "pause" }
+export interface BasketSnapshot { timestamp: number; navAtomic: bigint; drawdownBps: number }
 
 export const VIRTUAL_BASKET_INITIAL_NAV_ATOMIC = 1_000_000_000n;
 
@@ -249,312 +326,15 @@ export interface BasketExposurePreview {
   policy: BasketPolicy;
 }
 
-export function validateBasket(weights: BasketAgentWeight[], policy: BasketPolicy): string[] {
-  const errors: string[] = [];
-  if (weights.some((item) => !Number.isInteger(item.weightBps))) errors.push("weights_must_be_integers");
-  if (weights.reduce((sum, item) => sum + item.weightBps, 0) !== 10_000) errors.push("weights_must_total_10000_bps");
-  if (new Set(weights.map((item) => item.agentId)).size !== weights.length) errors.push("duplicate_agent");
-  if (weights.some((item) => item.weightBps <= 0 || item.weightBps > policy.maxSingleAgentBps)) errors.push("single_agent_exposure");
-  const categories = new Map<string, number>();
-  for (const item of weights) categories.set(item.category, (categories.get(item.category) ?? 0) + item.weightBps);
-  if ([...categories.values()].some((value) => value > policy.maxCategoryBps)) errors.push("category_exposure");
-  return errors;
-}
-
-/** Read-only backtest. Missing, paused and stale signals remain idle USDC (0% return). */
-export function simulateVirtualBasket(weights: BasketAgentWeight[], points: BasketReturnPoint[], initialNavAtomic = VIRTUAL_BASKET_INITIAL_NAV_ATOMIC): BasketSnapshot[] {
-  let nav = initialNavAtomic;
-  let high = nav;
-  return [...points].sort((a, b) => a.timestamp - b.timestamp).map((point) => {
-    let weightedReturn = 0n;
-    for (const agent of weights) {
-      if (agent.paused || agent.stale) continue;
-      weightedReturn += BigInt(point.returnsBps[agent.agentId] ?? 0) * BigInt(agent.weightBps);
-    }
-    nav = nav + (nav * weightedReturn) / 100_000_000n;
-    if (nav > high) high = nav;
-    const drawdownBps = high === 0n ? 0 : Number(((high - nav) * 10_000n) / high);
-    return { timestamp: point.timestamp, navAtomic: nav, drawdownBps };
-  });
-}
-
-export function basketExposure(weights: BasketAgentWeight[]) {
-  const categories: Record<string, number> = {};
-  const modes: Record<string, number> = {};
-  for (const item of weights) {
-    categories[item.category] = (categories[item.category] ?? 0) + item.weightBps;
-    modes[item.mode] = (modes[item.mode] ?? 0) + item.weightBps;
-  }
-  return { categories, modes };
-}
-
-function barsFromRecord(
-  record: Record<string, number>,
-  limitBps: number | null,
-): BasketExposureBar[] {
-  return Object.entries(record)
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([key, bps]) => ({
-      key,
-      bps,
-      overLimit: limitBps !== null && bps > limitBps,
-    }));
-}
-
 /**
- * Preview category / mode / agent concentration before a basket is created.
- *
- * - empty: no positive weights
- * - incomplete: weights present but do not total 10_000 bps (still shows bars)
- * - invalid: totals 10_000 but fails policy (or has duplicates / non-positive)
- * - ready: passes `validateBasket`
+ * A member's contribution to the basket NAV.
  */
-export function previewBasketExposureBeforeCreate(
-  weights: BasketAgentWeight[],
-  policy: BasketPolicy = DEFAULT_BASKET_POLICY,
-): BasketExposurePreview {
-  const active = weights.filter((item) => item.weightBps > 0);
-  const exposure = basketExposure(active);
-  const totalBps = active.reduce((sum, item) => sum + item.weightBps, 0);
-  const errors = active.length === 0 ? [] : validateBasket(active, policy);
-
-  let status: BasketExposurePreviewStatus;
-  if (active.length === 0) status = "empty";
-  else if (totalBps !== 10_000) status = "incomplete";
-  else if (errors.length > 0) status = "invalid";
-  else status = "ready";
-
-  const agentRecord: Record<string, number> = {};
-  for (const item of active) {
-    agentRecord[item.agentId] = (agentRecord[item.agentId] ?? 0) + item.weightBps;
-  }
-
-  return {
-    status,
-    totalBps,
-    categories: exposure.categories,
-    modes: exposure.modes,
-    categoryBars: barsFromRecord(exposure.categories, policy.maxCategoryBps),
-    modeBars: barsFromRecord(exposure.modes, null),
-    agentBars: barsFromRecord(agentRecord, policy.maxSingleAgentBps),
-    errors,
-    policy,
-  };
-}
-
-/**
- * An existing or prospective position taken by a follower.
- *
- * Values are denominated in integer/display USDC.
- */
-export interface FollowerPosition {
-  claimId: number;
+export interface NavMember {
   agentId: string;
-  category: string;
-  mode: string;
-  amountUsdc: number;
+  weightBps: number;
+  /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
+  returns: number[];
 }
-
-/**
- * Portfolio-level exposure breakdown across categories, modes, and agents.
- */
-export interface PortfolioExposureBreakdown {
-  totalUsdc: number;
-  categories: Record<string, number>;
-  modes: Record<string, number>;
-  agents: Record<string, number>;
-  categoryBps: Record<string, number>;
-  modeBps: Record<string, number>;
-  agentBps: Record<string, number>;
-  categoryBars: BasketExposureBar[];
-  modeBars: BasketExposureBar[];
-  agentBars: BasketExposureBar[];
-}
-
-/**
- * Candidate position under evaluation for mirroring.
- */
-export interface MirrorCandidatePosition {
-  claimId: number;
-  agentId: string;
-  category?: string;
-  mode?: string;
-  mirrorUsdc: number;
-}
-
-export type FollowerMirrorPreviewStatus =
-  | "ready"
-  | "policy_breach"
-  | "insufficient_budget"
-  | "already_mirrored"
-  | "invalid";
-
-/**
- * Detailed preview of taking a mirror position, showing remaining configured budget,
- * before-and-after portfolio exposure, and explicit non-custodial assertions.
- */
-export interface FollowerMirrorPreview {
-  status: FollowerMirrorPreviewStatus;
-  newPosition: FollowerPosition;
-  configuredBudgetUsdc: number;
-  remainingBudgetUsdc: number;
-  requiresUserSignature: true;
-  delegatedAuthority: false;
-  currentExposure: PortfolioExposureBreakdown;
-  projectedExposure: PortfolioExposureBreakdown;
-  policyViolations: string[];
-  policy: BasketPolicy;
-}
-
-/**
- * Compute portfolio exposure breakdown across categories, modes, and agents.
- */
-export function computePortfolioExposure(
-  positions: readonly FollowerPosition[],
-  policy: BasketPolicy = DEFAULT_BASKET_POLICY,
-): PortfolioExposureBreakdown {
-  const categories: Record<string, number> = {};
-  const modes: Record<string, number> = {};
-  const agents: Record<string, number> = {};
-  let totalUsdc = 0;
-
-  for (const pos of positions) {
-    if (pos.amountUsdc <= 0) continue;
-    totalUsdc += pos.amountUsdc;
-    const cat = pos.category || "general";
-    const mode = pos.mode || "pool";
-    categories[cat] = (categories[cat] ?? 0) + pos.amountUsdc;
-    modes[mode] = (modes[mode] ?? 0) + pos.amountUsdc;
-    agents[pos.agentId] = (agents[pos.agentId] ?? 0) + pos.amountUsdc;
-  }
-
-  const categoryBps: Record<string, number> = {};
-  const modeBps: Record<string, number> = {};
-  const agentBps: Record<string, number> = {};
-
-  if (totalUsdc > 0) {
-    for (const [k, v] of Object.entries(categories)) {
-      categoryBps[k] = Math.round((v / totalUsdc) * 10_000);
-    }
-    for (const [k, v] of Object.entries(modes)) {
-      modeBps[k] = Math.round((v / totalUsdc) * 10_000);
-    }
-    for (const [k, v] of Object.entries(agents)) {
-      agentBps[k] = Math.round((v / totalUsdc) * 10_000);
-    }
-  }
-
-  return {
-    totalUsdc: Math.round(totalUsdc * 100) / 100,
-    categories,
-    modes,
-    agents,
-    categoryBps,
-    modeBps,
-    agentBps,
-    categoryBars: barsFromRecord(categoryBps, policy.maxCategoryBps),
-    modeBars: barsFromRecord(modeBps, null),
-    agentBars: barsFromRecord(agentBps, policy.maxSingleAgentBps),
-  };
-}
-
-/**
- * Preview how taking a mirror candidate affects the follower's overall portfolio exposure,
- * checking remaining budget, category caps, and single-agent concentration limits.
- */
-export function previewFollowerMirrorExposure(args: {
-  currentPositions: readonly FollowerPosition[];
-  pendingMirror: MirrorCandidatePosition;
-  configuredBudgetUsdc: number;
-  policy?: BasketPolicy;
-}): FollowerMirrorPreview {
-  const policy = args.policy ?? DEFAULT_BASKET_POLICY;
-  const { currentPositions, pendingMirror, configuredBudgetUsdc } = args;
-
-  const violations: string[] = [];
-  const mirrorUsdc = pendingMirror.mirrorUsdc;
-
-  if (
-    typeof mirrorUsdc !== "number" ||
-    !Number.isFinite(mirrorUsdc) ||
-    mirrorUsdc <= 0 ||
-    typeof configuredBudgetUsdc !== "number" ||
-    !Number.isFinite(configuredBudgetUsdc) ||
-    configuredBudgetUsdc < 0
-  ) {
-    violations.push("invalid_input");
-  }
-
-  const alreadyMirrored = currentPositions.some(
-    (p) => p.claimId === pendingMirror.claimId,
-  );
-  if (alreadyMirrored) {
-    violations.push("already_mirrored");
-  }
-
-  const roundedMirrorUsdc = Math.round((mirrorUsdc || 0) * 100) / 100;
-  const remainingBudgetUsdc = Math.max(
-    0,
-    Math.round(((configuredBudgetUsdc || 0) - roundedMirrorUsdc) * 100) / 100,
-  );
-
-  if (roundedMirrorUsdc > configuredBudgetUsdc) {
-    violations.push("insufficient_budget");
-  }
-
-  const newPosition: FollowerPosition = {
-    claimId: pendingMirror.claimId,
-    agentId: pendingMirror.agentId,
-    category: pendingMirror.category || "general",
-    mode: pendingMirror.mode || "pool",
-    amountUsdc: roundedMirrorUsdc,
-  };
-
-  const currentExposure = computePortfolioExposure(currentPositions, policy);
-  const projectedPositions = alreadyMirrored
-    ? [...currentPositions]
-    : [...currentPositions, newPosition];
-  const projectedExposure = computePortfolioExposure(projectedPositions, policy);
-
-  for (const bar of projectedExposure.categoryBars) {
-    if (bar.overLimit) {
-      violations.push(`category_exposure_exceeded:${bar.key}`);
-    }
-  }
-
-  for (const bar of projectedExposure.agentBars) {
-    if (bar.overLimit) {
-      violations.push(`single_agent_exposure_exceeded:${bar.key}`);
-    }
-  }
-
-  let status: FollowerMirrorPreviewStatus;
-  if (violations.includes("invalid_input")) {
-    status = "invalid";
-  } else if (violations.includes("already_mirrored")) {
-    status = "already_mirrored";
-  } else if (violations.includes("insufficient_budget")) {
-    status = "insufficient_budget";
-  } else if (violations.length > 0) {
-    status = "policy_breach";
-  } else {
-    status = "ready";
-  }
-
-  return {
-    status,
-    newPosition,
-    configuredBudgetUsdc: Math.round(configuredBudgetUsdc * 100) / 100,
-    remainingBudgetUsdc,
-    requiresUserSignature: true as const,
-    delegatedAuthority: false as const,
-    currentExposure,
-    projectedExposure,
-    policyViolations: violations,
-    policy,
-  };
-}
-
 /**
  * Build a NAV series from basket member performance.
  *
@@ -580,7 +360,7 @@ export function buildNavSeries(
   if (totalWeight <= 0) return [];
 
   const periods = Math.min(...validMembers.map((m) => m.returns.length));
-  if (periods < 1 || !completeSeries(validMembers, periods)) return [];
+  if (periods < 1) return [];
 
   const points: NavPoint[] = [];
   let nav = 100;
@@ -656,8 +436,7 @@ export function dailyReturnPoints(results: readonly BasketAgentResult[]): Basket
   for (const [day, agents] of [...byDay.entries()].sort((a, b) => a[0] - b[0])) {
     const returnsBps: Record<string, number> = {};
     for (const [agentId, { pnl, stake }] of agents) {
-      if (stake <= 0n) continue;
-      returnsBps[agentId] = Number((pnl * 10_000n ) / stake);
+      returnsBps[agentId] = Number((pnl * 10_000n) / stake);
     }
     points.push({ timestamp: day, returnsBps });
   }
@@ -668,4 +447,90 @@ function completeSeries(members: readonly NavMember[], periods: number): boolean
   return members.every((m) =>
     m.returns.slice(0, periods).every((r) => Number.isFinite(r)),
   );
+}
+
+/** Stellar Testnet USDC SAC decimals (7, not 6). */
+export const MIRROR_USDC_DECIMALS = 7;
+
+/** 1 USDC in atomic units (10^7). */
+export const MIRROR_USDC_UNIT = 10_000_000n;
+
+/**
+ * Convert a non-negative USDC amount into exact 7-decimal atomic units.
+ *
+ * - `bigint` inputs are treated as already-atomic units.
+ * - `string` inputs are parsed as decimal USDC with up to 7 fractional digits.
+ * - `number` inputs are normalized to 7 fixed decimal places before integer parsing
+ *   to avoid IEEE-754 representation artifacts (e.g. `0.1 + 0.2`).
+ */
+export function toUsdcAtomic(amount: bigint | string | number): bigint {
+  if (typeof amount === "bigint") {
+    if (amount < 0n) throw new Error("USDC amount must be non-negative");
+    return amount;
+  }
+  if (typeof amount === "number") {
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new Error("USDC amount must be a finite non-negative number");
+    }
+    const [whole, fraction = ""] = amount.toFixed(MIRROR_USDC_DECIMALS).split(".");
+    return BigInt(whole) * MIRROR_USDC_UNIT + BigInt(fraction.padEnd(MIRROR_USDC_DECIMALS, "0"));
+  }
+  const trimmed = amount.trim();
+  if (!/^\d+(?:\.\d{1,7})?$/.test(trimmed)) {
+    throw new Error("Invalid USDC amount");
+  }
+  const [whole, fraction = ""] = trimmed.split(".");
+  return BigInt(whole) * MIRROR_USDC_UNIT + BigInt(fraction.padEnd(MIRROR_USDC_DECIMALS, "0"));
+}
+
+/**
+ * Compute the exact atomic mirror stake for a subscriber's per-market budget
+ * scaled by a basket member's basis-point weight.
+ *
+ * Uses integer division (`(budgetAtomic * weightBps) / 10_000n`) so the result
+ * never suffers floating-point drift or rounds up past the subscriber's cap.
+ * Returns `0n` for invalid or non-positive inputs.
+ */
+export function computeMirrorAmountAtomic(
+  perMarketUsdc: bigint | string | number,
+  weightBps: number,
+): bigint {
+  if (!isValidBps(weightBps) || weightBps === 0) return 0n;
+  let budgetAtomic: bigint;
+  try {
+    budgetAtomic = toUsdcAtomic(perMarketUsdc);
+  } catch {
+    return 0n;
+  }
+  if (budgetAtomic <= 0n) return 0n;
+  return (budgetAtomic * BigInt(weightBps)) / 10_000n;
+}
+
+/**
+ * Format an exact 7-decimal atomic USDC string (or bigint) for display in a
+ * UI consumer without passing through IEEE-754 floats.
+ *
+ * When `fixedDecimals` is provided, renders exactly that many fractional digits
+ * (truncated toward zero, e.g. `"6666000"` with `2` -> `"0.66"`). When omitted,
+ * renders the exact decimal value with trailing fractional zeros stripped
+ * (e.g. `"6666000"` -> `"0.6666"`).
+ */
+export function formatMirrorAtomicUsdc(
+  atomic: string | bigint,
+  fixedDecimals?: number,
+): string {
+  const value = typeof atomic === "bigint" ? atomic : BigInt(atomic);
+  const sign = value < 0n ? "-" : "";
+  const abs = value < 0n ? -value : value;
+  const whole = abs / MIRROR_USDC_UNIT;
+  const rawFraction = (abs % MIRROR_USDC_UNIT).toString().padStart(MIRROR_USDC_DECIMALS, "0");
+
+  if (fixedDecimals !== undefined) {
+    const digits = Math.max(0, Math.min(MIRROR_USDC_DECIMALS, Math.trunc(fixedDecimals)));
+    if (digits === 0) return `${sign}${whole}`;
+    return `${sign}${whole}.${rawFraction.slice(0, digits)}`;
+  }
+
+  const trimmed = rawFraction.replace(/0+$/, "");
+  return trimmed ? `${sign}${whole}.${trimmed}` : `${sign}${whole}`;
 }
