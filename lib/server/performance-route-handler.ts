@@ -19,7 +19,7 @@ import { apiError } from "@/lib/api/errors";
 import { authorizeRequest } from "@/lib/api/policy";
 import { getAgentTradeRows, getSyncMeta } from "@/lib/db";
 import {
-  resolvePerformanceState,
+  buildPortfolioPerformanceManifest,
   type PortfolioPerformanceResponse,
 } from "@/lib/portfolio-performance";
 import { parseAddressParam } from "@/lib/server/api-validation";
@@ -62,17 +62,21 @@ export const readIndexPerformance: PerformanceCalculator = async (address) => {
   const { performance, results } = computeAgentPerformance(rows);
   const updatedAtMs = Number(lastSettlementSync ?? "0");
 
-  const points = cumulativePnlPoints(results);
-  const state = resolvePerformanceState(points, performance.settled);
+  const cache = buildVSCacheFreshness({
+    updatedAtMs:
+      Number.isFinite(updatedAtMs) && updatedAtMs > 0 ? updatedAtMs : null,
+    freshnessWindowMs: performanceFreshnessWindowMs(),
+    source: "index",
+  });
 
   return {
     points,
     settled: performance.settled,
-    cache: buildVSCacheFreshness({
-      updatedAtMs:
-        Number.isFinite(updatedAtMs) && updatedAtMs > 0 ? updatedAtMs : null,
-      freshnessWindowMs: performanceFreshnessWindowMs(),
-      source: "index",
+    cache,
+    manifest: buildPortfolioPerformanceManifest({
+      address,
+      results,
+      cache,
     }),
     state,
   };
