@@ -141,12 +141,16 @@ export function PerformanceChart({
   }, [primaryCount]);
 
   const geometry = useMemo(() => {
-    if (invalid || allSeries.length === 0) return null;
+    if (effectiveState !== "available" || allSeries.length === 0) return null;
     const allPoints = allSeries.flatMap((s) => s.points);
-    if (allPoints.length === 0) return null;
-    const values = allPoints.map((point) => point.value);
-    const min = Math.min(baseline, ...values);
-    const max = Math.max(baseline, ...values);
+    const validNumericValues = allPoints
+      .map((p) => p.value)
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+
+    if (validNumericValues.length === 0) return null;
+
+    const min = Math.min(baseline, ...validNumericValues);
+    const max = Math.max(baseline, ...validNumericValues);
     // A flat series would divide by zero; give it a nominal band so it centres.
     const span = max - min || Math.max(1, Math.abs(max) * 0.02);
 
@@ -190,10 +194,11 @@ export function PerformanceChart({
     };
   }, [allSeries, baseline, invalid]);
 
-  if (invalid) {
+  if (effectiveState === "unavailable") {
     return (
       <div
         role="alert"
+        data-state="unavailable"
         className="border border-pv-danger/30 bg-pv-danger/[0.06] px-4 py-12 text-center text-sm text-pv-muted"
       >
         {invalidMessage}
@@ -201,7 +206,7 @@ export function PerformanceChart({
     );
   }
 
-  if (!geometry) {
+  if (effectiveState === "insufficient-history" || !geometry) {
     return (
       <div className="border border-pv-ink/[0.1] bg-pv-surface/40 px-4 py-12 text-center text-sm text-pv-muted">
         {emptyMessage}
@@ -219,7 +224,7 @@ export function PerformanceChart({
   const up = last.value >= baseline;
   const stroke = allSeries[0].stroke ?? (up ? "rgb(var(--pv-accent))" : "rgb(var(--pv-danger))");
   const length = pathRef.current?.getTotalLength?.() ?? 2000;
-  const table = buildPerformanceChartRows(points, valueSuffix);
+  const table = buildPerformanceChartRows(primaryPoints, valueSuffix, { state: effectiveState });
 
   const moveFocus = (next: number) => {
     const clamped = Math.max(0, Math.min(count - 1, next));
@@ -254,7 +259,7 @@ export function PerformanceChart({
   const activeDescription = `${formatDay(activePoint.timestamp)}, value ${activePoint.value.toFixed(2)}${valueSuffix}, ${formatCoverage(activePoint.coverage)}, observation ${active + 1} of ${count}`;
 
   return (
-    <figure className="border border-pv-ink/[0.1] bg-pv-surface/40 p-3">
+    <figure data-state="available" className="border border-pv-ink/[0.1] bg-pv-surface/40 p-3">
       <svg
         ref={svgRef}
         viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
@@ -300,7 +305,7 @@ export function PerformanceChart({
           ref={pathRef}
           d={primary.line}
           fill="none"
-          stroke={stroke}
+          stroke={allSeries[0]?.stroke ?? strokeDefault}
           strokeWidth="2"
           strokeLinecap="round"
           strokeLinejoin="round"

@@ -126,7 +126,8 @@ export function basketMessage(args: {
  * signed. Matches TRANSFER_EXPIRY_MS so the clock-skew budget is the same
  * across all signed mutations.
  */
-export const BASKET_EXPIRY_MS = 5 * 60_000; // 5 minutes
+export const BASKET_CREATION_EXPIRY_MS = 5 * 60_000; // 5 minutes
+export const BASKET_EXPIRY_MS = BASKET_CREATION_EXPIRY_MS;
 
 /**
  * How long a transfer authorisation is valid from the moment it is signed.
@@ -253,7 +254,12 @@ export function parsePerMarketUsdc(raw: string): PerMarketParseResult {
  *
  * This list must stay in sync with the basket directory.
  */
-export const CURATED_BASKET_IDS: readonly string[] = [];
+export const CURATED_BASKET_IDS: readonly string[] = [
+  "council-core",
+  "philosopher-spread",
+  "byoa-traders",
+  "house-and-street",
+];
 
 /**
  * A single point on a basket's NAV series.
@@ -269,6 +275,13 @@ export interface NavPoint {
  * A member's contribution to the basket NAV.
  */
 export interface NavMember {
+  agentId: string;
+  weightBps: number;
+  /** Per-period returns for this member, as decimals (e.g. 0.01 = +1%). */
+  returns: number[];
+}
+
+export interface BasketAgentWeight {
   agentId: string;
   weightBps: number;
   category: string;

@@ -1713,7 +1713,7 @@ export interface ListProposalsResult {
  * List proposals for review with optional status filtering and pagination.
  */
 export async function listProposalsForReview(
-  opts: ListProposalsOptions = {},
+  opts: ListProposalsOptions = {}
 ): Promise<ListProposalsResult> {
   const pool = await getDb();
   let limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) ? Math.trunc(opts.limit) : 50;
@@ -1748,32 +1748,6 @@ export async function getProposal(proposalId: string): Promise<MarketProposalRow
     args: [proposalId],
   });
   return (result.rows[0] as unknown as MarketProposalRow) ?? null;
-}
-
-/**
- * Query bounded unresolved proposals and return an operator backlog triage export
- * grouped by age and blocking reason, with private source text and signing metadata omitted.
- */
-export async function getProposalBacklogTriage(opts: {
-  limit?: number;
-  offset?: number;
-  now?: number;
-} = {}): Promise<ProposalBacklogTriageExport> {
-  const pool = await getDb();
-  let limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) ? Math.trunc(opts.limit) : 50;
-  limit = Math.max(1, Math.min(200, limit));
-  let offset = typeof opts.offset === "number" && Number.isFinite(opts.offset) ? Math.trunc(opts.offset) : 0;
-  offset = Math.max(0, offset);
-
-  const sql = `SELECT * FROM market_proposals WHERE review_status IN ('queued', 'in_review') ORDER BY COALESCE(queued_at, created_at) ASC, created_at ASC LIMIT ? OFFSET ?`;
-  const result = await execute(pool, { sql, args: [limit, offset] });
-  const rows = result.rows as unknown as MarketProposalRow[];
-
-  return buildProposalBacklogTriage(rows, {
-    now: opts.now,
-    limit,
-    offset,
-  });
 }
 
 /** Link a published claim back to the proposal that produced it. */

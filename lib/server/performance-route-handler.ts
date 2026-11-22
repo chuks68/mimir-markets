@@ -70,7 +70,7 @@ export const readIndexPerformance: PerformanceCalculator = async (address) => {
   });
 
   return {
-    points: cumulativePnlPoints(results),
+    points,
     settled: performance.settled,
     cache,
     manifest: buildPortfolioPerformanceManifest({
@@ -78,6 +78,7 @@ export const readIndexPerformance: PerformanceCalculator = async (address) => {
       results,
       cache,
     }),
+    state,
   };
 };
 
